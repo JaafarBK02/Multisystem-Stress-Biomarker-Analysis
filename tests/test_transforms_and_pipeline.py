@@ -81,3 +81,28 @@ def test_cli_writes_data_and_report(tmp_path, raw):
     report = json.loads(out.with_suffix(".report.json").read_text())
     assert report["config"]["hrv_baseline"] == "b2"
     assert report["sentinel_audit"], "audit should list the planted sentinel codes"
+
+
+def test_winsorize_iqr_clips_only_extremes():
+    df = pd.DataFrame({"x": [1.0, 2.0, 3.0, 4.0, 1000.0]})
+    out, clipped = transforms.winsorize_iqr(df, ["x"], k=3.0)
+    assert clipped["x"] == 1
+    assert out["x"].iloc[:4].tolist() == [1.0, 2.0, 3.0, 4.0]
+    assert out["x"].iloc[4] == pytest.approx(4.0 + 3 * 2.0)  # Q3 + 3*IQR (Q1=2, Q3=4)
+    assert len(out) == len(df)  # nobody dropped
+
+
+def test_yeojohnson_only_touches_skewed_columns():
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame({"skewed": rng.lognormal(0, 1, 1000), "normal": rng.normal(0, 1, 1000)})
+    res = transforms.transform_indicators(df, ["skewed", "normal"], "yeojohnson", skip=(), skew_threshold=1.0)
+    assert "skewed" in res.params and "normal" not in res.params
+    assert abs(res.data["skewed"].skew()) < 0.2
+    assert res.data["normal"].equals(df["normal"])
+
+
+@pytest.mark.parametrize("method", ["yeojohnson", "boxcox", "log", "none"])
+def test_pipeline_runs_with_each_transform(raw, method):
+    result = pipeline.run(raw, pipeline.PipelineConfig(transform=method))
+    assert not result.data.isna().any().any()
+    assert result.report["config"]["transform"] == method

@@ -3,7 +3,9 @@
 Latent profile analysis with Gaussian mixtures assumes roughly normal
 indicators within each profile. Raw HRV power and urinary hormone values are
 heavily right-skewed (skew of 2-8), so they are transformed before modelling.
-See notebooks/03 for the comparison that led to Box-Cox as the default.
+Notebook 03 shows why a per-variable power transform beats deleting outliers;
+the default (3 x IQR clipping, then Yeo-Johnson on |skew| > 1) matches the
+analysis presented at SPARC 2026.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-Transform = Literal["none", "log", "boxcox"]
+Transform = Literal["none", "log", "boxcox", "yeojohnson"]
 
 
 @dataclass
@@ -32,24 +34,48 @@ def _positive_shift(s: pd.Series) -> float:
     return 0.0 if m > 0 else float(1.0 - m)
 
 
-def transform_indicators(df: pd.DataFrame, columns: Sequence[str], method: Transform = "boxcox",
-                         skip: Sequence[str] = ("hr",)) -> TransformResult:
+def winsorize_iqr(df: pd.DataFrame, columns: Sequence[str], k: float = 3.0) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """Clip each column to [Q1 - k*IQR, Q3 + k*IQR]. Returns (data, values clipped per column).
+
+    With k = 3 only extreme values are touched, and nobody is dropped.
+    """
+    out = df.copy()
+    clipped: Dict[str, int] = {}
+    for c in columns:
+        q1, q3 = out[c].quantile([0.25, 0.75])
+        lo, hi = q1 - k * (q3 - q1), q3 + k * (q3 - q1)
+        clipped[c] = int(((out[c] < lo) | (out[c] > hi)).sum())
+        out[c] = out[c].clip(lo, hi)
+    return out, clipped
+
+
+def transform_indicators(df: pd.DataFrame, columns: Sequence[str], method: Transform = "yeojohnson",
+                         skip: Sequence[str] = ("hr",), skew_threshold: float = 0.0) -> TransformResult:
     """Apply ``method`` to raw (unstandardised) ``columns``.
 
     Transforms must run on raw values, *before* z-scoring. Shifting z-scores to
     be positive and then logging them (as an earlier exploratory notebook did)
     is not equivalent to log-transforming the measurement.
 
+    Columns in ``skip``, or with |skew| <= ``skew_threshold``, are left as is.
     Heart rate is roughly normal already and is skipped by default.
+
+    Yeo-Johnson is a generalisation of Box-Cox that also handles zero and
+    negative values, so it needs no shift.
     """
     out = df.copy()
     params: Dict[str, Dict[str, float]] = {}
     if method == "none":
         return TransformResult(out, method, params)
     for col in columns:
-        if col in skip:
-            continue
         s = out[col].dropna()
+        if col in skip or abs(s.skew()) <= skew_threshold:
+            continue
+        if method == "yeojohnson":
+            values, lam = stats.yeojohnson(s.astype(float))
+            out.loc[s.index, col] = values
+            params[col] = {"lambda": float(lam)}
+            continue
         shift = _positive_shift(s)
         if method == "log":
             out.loc[s.index, col] = np.log(s + shift)

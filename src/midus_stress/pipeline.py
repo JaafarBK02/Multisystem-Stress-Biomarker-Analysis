@@ -34,8 +34,16 @@ from .config import (
 
 @dataclass
 class PipelineConfig:
+    """Defaults reproduce the preprocessing behind the SPARC 2026 results:
+    average both baselines, clip at 3 x IQR, Yeo-Johnson any indicator with
+    |skew| > 1, then z-score. ``transform="boxcox"`` gives the alternative
+    explored in notebook 03.
+    """
+
     hrv_baseline: cleaning.HrvBaseline = "mean"
-    transform: transforms.Transform = "boxcox"
+    winsorize_iqr: Optional[float] = 3.0
+    transform: transforms.Transform = "yeojohnson"
+    skew_threshold: float = 1.0
     standardize_outcomes: bool = True
 
 
@@ -81,8 +89,13 @@ def run(raw: pd.DataFrame, config: Optional[PipelineConfig] = None) -> PipelineR
     report["cvd_risk_counts"] = merged["cvd_risk"].value_counts().sort_index().to_dict()
     report["raw_distribution"] = transforms.distribution_summary(merged, LPA_INDICATORS).round(3).to_dict(orient="index")
 
-    # 4. Transform raw indicators, then standardise ---------------------------
-    tr = transforms.transform_indicators(merged, LPA_INDICATORS, cfg.transform)
+    # 4. Clip extremes, transform raw indicators, then standardise -----------
+    if cfg.winsorize_iqr is not None:
+        merged, clipped = transforms.winsorize_iqr(merged, LPA_INDICATORS, cfg.winsorize_iqr)
+        report["winsorized_values"] = clipped
+    skip = ("hr",) if cfg.transform == "boxcox" else ()
+    tr = transforms.transform_indicators(merged, LPA_INDICATORS, cfg.transform,
+                                         skip=skip, skew_threshold=cfg.skew_threshold)
     report["transform_params"] = tr.params
     final = transforms.zscore(tr.data, LPA_INDICATORS)
     if cfg.standardize_outcomes:
@@ -98,12 +111,22 @@ def main(argv: Optional[list[str]] = None) -> None:
     p.add_argument("--input", required=True, help="Raw MIDUS 2 aggregated export (.tsv or .csv)")
     p.add_argument("--output", required=True, help="Where to write the processed CSV")
     p.add_argument("--hrv-baseline", choices=["mean", "b1", "b2"], default="mean")
-    p.add_argument("--transform", choices=["none", "log", "boxcox"], default="boxcox")
+    p.add_argument("--transform", choices=["none", "log", "boxcox", "yeojohnson"], default="yeojohnson")
+    p.add_argument("--skew-threshold", type=float, default=1.0,
+                   help="Only transform indicators with |skew| above this (default 1.0)")
+    p.add_argument("--winsorize-iqr", type=float, default=3.0,
+                   help="Clip at Q1/Q3 -/+ k*IQR; pass 0 to disable (default 3)")
     p.add_argument("--no-standardize-outcomes", action="store_true")
     args = p.parse_args(argv)
 
     raw = load_raw(args.input)
-    cfg = PipelineConfig(args.hrv_baseline, args.transform, not args.no_standardize_outcomes)
+    cfg = PipelineConfig(
+        hrv_baseline=args.hrv_baseline,
+        winsorize_iqr=args.winsorize_iqr or None,
+        transform=args.transform,
+        skew_threshold=args.skew_threshold,
+        standardize_outcomes=not args.no_standardize_outcomes,
+    )
     result = run(raw, cfg)
     result.report["sentinel_audit"] = cleaning.audit_sentinels(raw, BIOMARKERS + OUTCOMES).to_dict(orient="records")
 
